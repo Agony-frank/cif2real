@@ -1,10 +1,49 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import itertools
 from util.image_pool import ImagePool
 from .base_model import BaseModel
 from . import networks
+from . import unet_model
+from .dice_score import dice_loss
+from .unet_model import UNet
 
+class ModifiedFocalLoss(nn.Module):
+    def __init__(self, alpha=0.8, gamma=2, reduction='mean'):
+        super(ModifiedFocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
 
+    def forward(self, inputs, targets, cluster_mask):
+        """
+        inputs: 预测结果，形状为 (N, C, H, W), 其中C为类别数
+        targets: 真实标签，形状为 (N, H, W)，每个像素的值为类别索引
+        cluster_mask: 分子团簇的掩码，形状为 (N, H, W), 分子团簇的像素为1, 其他像素为0
+        """
+        # 将输入和目标转换为适合二值交叉熵损失的形状
+        inputs_flat = inputs.view(-1)
+        targets_flat = targets.view(-1).float()
+        cluster_mask_flat = cluster_mask.view(-1).float()
+
+        # 计算标准的二值交叉熵损失
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs_flat, targets_flat, reduction='none')
+        
+        # 计算Focal Loss的调整因子
+        pt = torch.exp(-BCE_loss)  # 获取概率
+        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+
+        # 通过分子团簇掩码调整损失，增加分子团簇的权重
+        F_loss_adjusted = F_loss * (1 + cluster_mask_flat * (self.alpha - 1))
+
+        if self.reduction == 'mean':
+            return F_loss_adjusted.mean()
+        elif self.reduction == 'sum':
+            return F_loss_adjusted.sum()
+        else:
+            return F_loss_adjusted
+        
 class CycleGANModel(BaseModel):
     """
     This class implements the CycleGAN model, for learning image-to-image translation without paired data.
@@ -41,6 +80,10 @@ class CycleGANModel(BaseModel):
             parser.add_argument('--lambda_A', type=float, default=10.0, help='weight for cycle loss (A -> B -> A)')
             parser.add_argument('--lambda_B', type=float, default=10.0, help='weight for cycle loss (B -> A -> B)')
             parser.add_argument('--lambda_identity', type=float, default=0.5, help='use identity mapping. Setting lambda_identity other than 0 has an effect of scaling the weight of the identity mapping loss. For example, if the weight of the identity loss should be 10 times smaller than the weight of the reconstruction loss, please set lambda_identity = 0.1')
+            # add the weights for unet segmentation loss
+            parser.add_argument('--lambda_seg', type=float, default=1.0, help='weight for segmentation loss')
+            # add the weights for focal loss
+            parser.add_argument('--lambda_focal', type=float, default=1.0, help='weight for focal loss')
 
         return parser
 
@@ -52,7 +95,7 @@ class CycleGANModel(BaseModel):
         """
         BaseModel.__init__(self, opt)
         # specify the training losses you want to print out. The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B']
+        self.loss_names = ['G', 'D_A', 'G_A', 'U', 'focal_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B']
         # specify the images you want to save/display. The training/test scripts will call <BaseModel.get_current_visuals>
         visual_names_A = ['real_A', 'fake_B', 'rec_A']
         visual_names_B = ['real_B', 'fake_A', 'rec_B']
@@ -74,6 +117,8 @@ class CycleGANModel(BaseModel):
                                         not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
         self.netG_B = networks.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
                                         not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+        self.netU_A = unet_model.UNet(opt.input_nc, opt.output_nc, bilinear=True).to(self.device)
+
 
         if self.isTrain:  # define discriminators
             self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD,
@@ -90,11 +135,21 @@ class CycleGANModel(BaseModel):
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)  # define GAN loss.
             self.criterionCycle = torch.nn.L1Loss()
             self.criterionIdt = torch.nn.L1Loss()
+            # add the loss functions for unet segmentation
+            self.criterionSegmentation = torch.nn.CrossEntropyLoss() if self.opt.output_nc > 1 else torch.nn.BCEWithLogitsLoss()
+            # add the loss functions for focal loss
+            self.criterionFocal = ModifiedFocalLoss(alpha=0.8, gamma=2).to(self.device)
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
-            self.optimizer_G = torch.optim.Adam(itertools.chain(self.netG_A.parameters(), self.netG_B.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
+            self.optimizer_G = torch.optim.Adam(itertools.chain(self.netG_A.parameters(), self.netG_B.parameters(), self.netU_A.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizer_D = torch.optim.Adam(itertools.chain(self.netD_A.parameters(), self.netD_B.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
+            # add the optimizer for unet segmentation
+            # self.optimizer_U = torch.optim.RMSprop(self.netU_A.parameters(), lr=opt.lr, weight_decay=opt.weight_decay, momentum=opt.momentum) #这里要补充weight和momentum
+
+            
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
+            #self.optimizers.append(self.optimizer_U)
+            
 
     def set_input(self, input):
         """Unpack input data from the dataloader and perform necessary pre-processing steps.
@@ -106,6 +161,9 @@ class CycleGANModel(BaseModel):
         """
         AtoB = self.opt.direction == 'AtoB'
         self.real_A = input['A' if AtoB else 'B'].to(self.device)
+        # add the real_A_labels
+        self.real_A_labels = input['A_labels'].to(self.device)
+
         self.real_B = input['B' if AtoB else 'A'].to(self.device)
         self.image_paths = input['A_paths' if AtoB else 'B_paths']
 
@@ -115,6 +173,7 @@ class CycleGANModel(BaseModel):
         self.rec_A = self.netG_B(self.fake_B)   # G_B(G_A(A))
         self.fake_A = self.netG_B(self.real_B)  # G_B(B)
         self.rec_B = self.netG_A(self.fake_A)   # G_A(G_B(B))
+        self.segmentation_output = self.netU_A(self.real_A) 
 
     def backward_D_basic(self, netD, real, fake):
         """Calculate GAN loss for the discriminator
@@ -153,6 +212,8 @@ class CycleGANModel(BaseModel):
         lambda_idt = self.opt.lambda_identity
         lambda_A = self.opt.lambda_A
         lambda_B = self.opt.lambda_B
+        lambda_focal = self.opt.lambda_focal
+        lambda_seg = self.opt.lambda_seg
         # Identity loss
         if lambda_idt > 0:
             # G_A should be identity if real_B is fed: ||G_A(B) - B||
@@ -173,9 +234,21 @@ class CycleGANModel(BaseModel):
         self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
         # Backward cycle loss || G_A(G_B(B)) - B||
         self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
+        # 
+        self.loss_U = self.criterionSegmentation(self.segmentation_output, self.real_A_labels)  # real_A_labels是对应的标签
+        self.loss_U += dice_loss(self.segmentation_output, self.real_A_labels) * lambda_seg
+        # Forward focal loss
+        self.loss_focal_A = self.criterionFocal(self.rec_A, self.real_A, self.real_A_labels) * lambda_focal
         # combined loss and calculate gradients
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B + self.loss_U + self.loss_focal_A
         self.loss_G.backward()
+
+    # def backward_U(self):
+    #     """计算U-Net的损失"""
+    #     self.segmentation_output = self.netU_A(self.real_A)  # 假设real_A是带分割的图像
+    #     self.loss_U = self.criterionSegmentation(self.segmentation_output, self.real_A_labels)  # real_A_labels是对应的标签
+    #     self.loss_U += dice_loss(self.segmentation_output, self.real_A_labels)
+    #     self.loss_U.backward()
 
     def optimize_parameters(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
@@ -186,6 +259,10 @@ class CycleGANModel(BaseModel):
         self.optimizer_G.zero_grad()  # set G_A and G_B's gradients to zero
         self.backward_G()             # calculate gradients for G_A and G_B
         self.optimizer_G.step()       # update G_A and G_B's weights
+        # U-Net
+        # self.optimizer_U.zero_grad() # set U-Net's gradients to zero
+        # self.backward_U()  # 更新U-Net的梯度
+        # self.optimizer_U.step()
         # D_A and D_B
         self.set_requires_grad([self.netD_A, self.netD_B], True)
         self.optimizer_D.zero_grad()   # set D_A and D_B's gradients to zero
