@@ -9,12 +9,13 @@ from . import unet_model
 from .dice_score import dice_loss
 from .unet_model import UNet
 
-class ModifiedFocalLoss(nn.Module):
+class ModifiedFocalLossL1(nn.Module):
     def __init__(self, alpha=0.8, gamma=2, reduction='mean'):
-        super(ModifiedFocalLoss, self).__init__()
+        super(ModifiedFocalLossL1, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
+        self.l1_loss = nn.L1Loss(reduction='none')  # 使用none保持每个元素的损失
 
     def forward(self, inputs, targets, cluster_mask):
         """
@@ -22,20 +23,18 @@ class ModifiedFocalLoss(nn.Module):
         targets: 真实标签，形状为 (N, H, W)，每个像素的值为类别索引
         cluster_mask: 分子团簇的掩码，形状为 (N, H, W), 分子团簇的像素为1, 其他像素为0
         """
-        # 将输入和目标转换为适合二值交叉熵损失的形状
-        inputs_flat = inputs.view(-1)
-        targets_flat = targets.view(-1).float()
-        cluster_mask_flat = cluster_mask.view(-1).float()
+        # 使用L1 Loss计算预测结果和目标之间的损失
+        L1_loss = self.l1_loss(inputs, targets)
 
-        # 计算标准的二值交叉熵损失
-        BCE_loss = F.binary_cross_entropy_with_logits(inputs_flat, targets_flat, reduction='none')
-        
         # 计算Focal Loss的调整因子
-        pt = torch.exp(-BCE_loss)  # 获取概率
-        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+        # 注意：L1 Loss不直接提供概率，这里我们需要重新考虑如何应用Focal Loss的概念
+        # 这里简化处理，直接使用L1_loss的值计算调整因子，这不是标准的Focal Loss应用方式
+        pt = torch.exp(-L1_loss)
+        F_loss = self.alpha * (1-pt)**self.gamma * L1_loss
 
         # 通过分子团簇掩码调整损失，增加分子团簇的权重
-        F_loss_adjusted = F_loss * (1 + cluster_mask_flat * (self.alpha - 1))
+        cluster_mask_expanded = cluster_mask.expand_as(L1_loss)  # 确保cluster_mask的形状与L1_loss相同
+        F_loss_adjusted = F_loss * (1 + cluster_mask_expanded * (self.alpha - 1))
 
         if self.reduction == 'mean':
             return F_loss_adjusted.mean()
@@ -81,9 +80,9 @@ class CycleGANModel(BaseModel):
             parser.add_argument('--lambda_B', type=float, default=10.0, help='weight for cycle loss (B -> A -> B)')
             parser.add_argument('--lambda_identity', type=float, default=0.5, help='use identity mapping. Setting lambda_identity other than 0 has an effect of scaling the weight of the identity mapping loss. For example, if the weight of the identity loss should be 10 times smaller than the weight of the reconstruction loss, please set lambda_identity = 0.1')
             # add the weights for unet segmentation loss
-            parser.add_argument('--lambda_seg', type=float, default=1.0, help='weight for segmentation loss')
+            parser.add_argument('--lambda_seg', type=float, default=1, help='weight for segmentation loss')
             # add the weights for focal loss
-            parser.add_argument('--lambda_focal', type=float, default=1.0, help='weight for focal loss')
+            parser.add_argument('--lambda_focal', type=float, default=1, help='weight for focal loss')
 
         return parser
 
@@ -136,9 +135,9 @@ class CycleGANModel(BaseModel):
             self.criterionCycle = torch.nn.L1Loss()
             self.criterionIdt = torch.nn.L1Loss()
             # add the loss functions for unet segmentation
-            self.criterionSegmentation = torch.nn.CrossEntropyLoss() if self.opt.output_nc > 1 else torch.nn.BCEWithLogitsLoss()
+            # self.criterionSegmentation = torch.nn.CrossEntropyLoss() if self.opt.output_nc > 1 else torch.nn.BCEWithLogitsLoss()
             # add the loss functions for focal loss
-            self.criterionFocal = ModifiedFocalLoss(alpha=0.8, gamma=2).to(self.device)
+            self.criterionFocal = ModifiedFocalLossL1(alpha=0.8, gamma=2).to(self.device)
             # initialize optimizers; schedulers will be automatically created by function <BaseModel.setup>.
             self.optimizer_G = torch.optim.Adam(itertools.chain(self.netG_A.parameters(), self.netG_B.parameters(), self.netU_A.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
             self.optimizer_D = torch.optim.Adam(itertools.chain(self.netD_A.parameters(), self.netD_B.parameters()), lr=opt.lr, betas=(opt.beta1, 0.999))
@@ -173,7 +172,7 @@ class CycleGANModel(BaseModel):
         self.rec_A = self.netG_B(self.fake_B)   # G_B(G_A(A))
         self.fake_A = self.netG_B(self.real_B)  # G_B(B)
         self.rec_B = self.netG_A(self.fake_A)   # G_A(G_B(B))
-        self.segmentation_output = self.netU_A(self.real_A) 
+        self.segmentation_output = torch.sigmoid(self.netU_A(self.fake_B))  # U-Net的输出
 
     def backward_D_basic(self, netD, real, fake):
         """Calculate GAN loss for the discriminator
@@ -235,8 +234,8 @@ class CycleGANModel(BaseModel):
         # Backward cycle loss || G_A(G_B(B)) - B||
         self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
         # 
-        self.loss_U = self.criterionSegmentation(self.segmentation_output, self.real_A_labels)  # real_A_labels是对应的标签
-        self.loss_U += dice_loss(self.segmentation_output, self.real_A_labels) * lambda_seg
+        #self.loss_U = self.criterionSegmentation(self.segmentation_output, self.real_A_labels)  # real_A_labels是对应的标签
+        self.loss_U = dice_loss(self.segmentation_output, self.real_A_labels) * lambda_seg
         # Forward focal loss
         self.loss_focal_A = self.criterionFocal(self.rec_A, self.real_A, self.real_A_labels) * lambda_focal
         # combined loss and calculate gradients
@@ -257,8 +256,8 @@ class CycleGANModel(BaseModel):
         # G_A and G_B
         self.set_requires_grad([self.netD_A, self.netD_B], False)  # Ds require no gradients when optimizing Gs
         self.optimizer_G.zero_grad()  # set G_A and G_B's gradients to zero
-        self.backward_G()             # calculate gradients for G_A and G_B
-        self.optimizer_G.step()       # update G_A and G_B's weights
+        self.backward_G()             # calculate gradients for G_A and G_B and U-Net
+        self.optimizer_G.step()       # update G_A and G_B and U-Net's weights
         # U-Net
         # self.optimizer_U.zero_grad() # set U-Net's gradients to zero
         # self.backward_U()  # 更新U-Net的梯度
